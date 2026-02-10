@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -19,6 +20,7 @@ SCHEDULER_DAYS = 30
 SCHEDULER_ENABLED = True
 _scheduler_started = False
 _scheduler_stop_event = threading.Event()
+_scheduler_backoff_until: Optional[datetime] = None
 
 TEMPLATE = """
 <!doctype html>
@@ -623,6 +625,9 @@ def _get_default_customer_id() -> str | None:
 def _scheduler_loop() -> None:
     while not _scheduler_stop_event.is_set():
         try:
+            if _scheduler_backoff_until and datetime.now() < _scheduler_backoff_until:
+                _scheduler_stop_event.wait(5)
+                continue
             customer_id = _get_default_customer_id()
             if customer_id:
                 client = _build_client()
@@ -632,6 +637,7 @@ def _scheduler_loop() -> None:
                 rows = ads._rows_with_total(rows)
                 _persist_run(customer_id, SCHEDULER_DAYS, rows)
         except Exception as ex:
+            _apply_backoff(ex)
             print(f"[scheduler] {ex}")
         _scheduler_stop_event.wait(SCHEDULER_INTERVAL_SECONDS)
 
@@ -646,6 +652,16 @@ def _start_scheduler() -> None:
     thread = threading.Thread(target=_scheduler_loop, daemon=True)
     thread.start()
     _scheduler_started = True
+
+
+def _apply_backoff(ex: Exception) -> None:
+    global _scheduler_backoff_until
+    message = str(ex)
+    if "Resource has been exhausted" not in message and "429" not in message:
+        return
+    match = re.search(r"Retry in (\\d+) seconds", message)
+    seconds = int(match.group(1)) if match else 3600
+    _scheduler_backoff_until = datetime.now() + timedelta(seconds=seconds)
 
 
 @app.route("/", methods=["GET"])
