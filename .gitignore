@@ -1,0 +1,9 @@
+.env
+ads_history.db
+*.db
+*.csv
+*.xlsx
+gen-lang-client-*.json
+service-account*.json
+__pycache__/
+.venv/
