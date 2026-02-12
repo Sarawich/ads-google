@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import List, Optional
 
-from flask import Flask, request, render_template_string
+from flask import Flask, redirect, render_template_string, request, url_for
 
 import export_campaigns as ads
 
@@ -21,6 +21,7 @@ SCHEDULER_ENABLED = True
 _scheduler_started = False
 _scheduler_stop_event = threading.Event()
 _scheduler_backoff_until: Optional[datetime] = None
+_scheduler_forced_enabled = False
 
 TEMPLATE = """
 <!doctype html>
@@ -80,12 +81,45 @@ TEMPLATE = """
         border-radius: 8px;
         color: #991b1b;
       }
+      .mini-game {
+        margin-top: 16px;
+        padding: 12px;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        background: #f9fafb;
+        max-width: 420px;
+      }
+      .mini-game h2 {
+        margin: 0 0 8px;
+        font-size: 16px;
+      }
+      .mini-game .score {
+        font-weight: 700;
+      }
+      .mini-game .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .mini-game canvas {
+        display: block;
+        background: #0f172a;
+        border: 1px solid #111827;
+        border-radius: 6px;
+      }
     </style>
   </head>
   <body>
     <h1>Google Ads Campaigns</h1>
     <div class="meta">Fetched at {{ fetched_at }}</div>
     <div class="meta"><a href="/history">View history</a></div>
+    <div class="meta">
+      Scheduler: {{ scheduler_status }}{% if backoff_until %} • Backoff until {{ backoff_until }}{% endif %}
+    </div>
+    {% if message %}
+      <div class="meta">{{ message }}</div>
+    {% endif %}
 
     <form method="get">
       <div>
@@ -100,6 +134,24 @@ TEMPLATE = """
         <button type="submit">Refresh</button>
       </div>
     </form>
+
+    <form method="post" action="/control" style="margin-top: 8px;">
+      <input type="hidden" name="customer_id" value="{{ customer_id or '' }}" />
+      <button name="action" value="start" type="submit">Start Auto Fetch</button>
+      <button name="action" value="stop" type="submit">Stop Auto Fetch</button>
+      <button name="action" value="run_once" type="submit">Run Once</button>
+    </form>
+
+    <div class="mini-game">
+      <h2>Mini Game: XO</h2>
+      <canvas id="xo-canvas" width="240" height="240"></canvas>
+      <div class="row" style="margin-top: 8px;">
+        <button id="xo-reset" type="button">Reset</button>
+        <div>Winner: <span class="score" id="xo-winner">-</span></div>
+        <div>Turn: <span class="score" id="xo-turn">X</span></div>
+      </div>
+      <div class="meta">Click a cell to place X or O. Local only.</div>
+    </div>
 
     {% if error %}
       <div class="error">{{ error }}</div>
@@ -135,6 +187,101 @@ TEMPLATE = """
     {% else %}
       <div class="meta">Enter a customer ID to load campaigns.</div>
     {% endif %}
+
+    <script>
+      (function () {
+        const canvas = document.getElementById("xo-canvas");
+        const ctx = canvas.getContext("2d");
+        const resetBtn = document.getElementById("xo-reset");
+        const winnerEl = document.getElementById("xo-winner");
+        const turnEl = document.getElementById("xo-turn");
+
+        const size = 3;
+        const cell = 80;
+        const board = Array.from({ length: size }, () => Array(size).fill(""));
+        let current = "X";
+        let winner = "";
+
+        const drawGrid = () => {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.strokeStyle = "#e5e7eb";
+          ctx.lineWidth = 2;
+          for (let i = 1; i < size; i++) {
+            ctx.beginPath();
+            ctx.moveTo(i * cell, 0);
+            ctx.lineTo(i * cell, canvas.height);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(0, i * cell);
+            ctx.lineTo(canvas.width, i * cell);
+            ctx.stroke();
+          }
+        };
+
+        const drawMarks = () => {
+          ctx.font = "48px Arial";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          for (let y = 0; y < size; y++) {
+            for (let x = 0; x < size; x++) {
+              const value = board[y][x];
+              if (!value) continue;
+              ctx.fillStyle = value === "X" ? "#e2e8f0" : "#60a5fa";
+              ctx.fillText(value, x * cell + cell / 2, y * cell + cell / 2);
+            }
+          }
+        };
+
+        const checkWinner = () => {
+          const lines = [];
+          for (let i = 0; i < size; i++) {
+            lines.push(board[i]);
+            lines.push([board[0][i], board[1][i], board[2][i]]);
+          }
+          lines.push([board[0][0], board[1][1], board[2][2]]);
+          lines.push([board[0][2], board[1][1], board[2][0]]);
+          for (const line of lines) {
+            if (line.every((v) => v === "X")) return "X";
+            if (line.every((v) => v === "O")) return "O";
+          }
+          return "";
+        };
+
+        const isDraw = () => board.flat().every((v) => v);
+
+        const render = () => {
+          drawGrid();
+          drawMarks();
+          winnerEl.textContent = winner || "-";
+          turnEl.textContent = current;
+        };
+
+        const reset = () => {
+          for (let y = 0; y < size; y++) {
+            for (let x = 0; x < size; x++) board[y][x] = "";
+          }
+          current = "X";
+          winner = "";
+          render();
+        };
+
+        canvas.addEventListener("click", (event) => {
+          if (winner) return;
+          const rect = canvas.getBoundingClientRect();
+          const x = Math.floor((event.clientX - rect.left) / cell);
+          const y = Math.floor((event.clientY - rect.top) / cell);
+          if (board[y][x]) return;
+          board[y][x] = current;
+          winner = checkWinner();
+          if (!winner && isDraw()) winner = "Draw";
+          if (!winner) current = current === "X" ? "O" : "X";
+          render();
+        });
+
+        resetBtn.addEventListener("click", reset);
+        render();
+      })();
+    </script>
   </body>
 </html>
 """
@@ -413,6 +560,10 @@ def _persist_run(customer_id: str, days: int, rows: List[ads.CampaignRow]) -> in
                     row.cost_per_conversion,
                 ),
             )
+    print(
+        f"[scheduler] run_id={run_id} fetched_at={fetched_at} "
+        f"customer_id={customer_id} days={days} rows={len(rows)}"
+    )
     return int(run_id)
 
 
@@ -622,23 +773,42 @@ def _get_default_customer_id() -> str | None:
     return os.getenv("GOOGLE_ADS_DEFAULT_CUSTOMER_ID")
 
 
+def _scheduler_is_enabled() -> bool:
+    return SCHEDULER_ENABLED or _scheduler_forced_enabled
+
+
+def _stop_scheduler() -> None:
+    global _scheduler_started, _scheduler_stop_event, _scheduler_backoff_until
+    if not _scheduler_started:
+        return
+    _scheduler_stop_event.set()
+    _scheduler_started = False
+    _scheduler_backoff_until = None
+    _scheduler_stop_event = threading.Event()
+
+
+def _run_once(customer_id: str, days: int) -> None:
+    client = _build_client()
+    rows: List[ads.CampaignRow] = ads._fetch_campaigns(client, customer_id, days)
+    rows = ads._rows_with_total(rows)
+    _persist_run(customer_id, days, rows)
+
+
 def _scheduler_loop() -> None:
     while not _scheduler_stop_event.is_set():
         try:
+            if not _scheduler_is_enabled():
+                _scheduler_stop_event.wait(1)
+                continue
             if _scheduler_backoff_until and datetime.now() < _scheduler_backoff_until:
                 _scheduler_stop_event.wait(5)
                 continue
             customer_id = _get_default_customer_id()
             if customer_id:
-                client = _build_client()
-                rows: List[ads.CampaignRow] = ads._fetch_campaigns(
-                    client, customer_id, SCHEDULER_DAYS
-                )
-                rows = ads._rows_with_total(rows)
-                _persist_run(customer_id, SCHEDULER_DAYS, rows)
+                _run_once(customer_id, SCHEDULER_DAYS)
         except Exception as ex:
             _apply_backoff(ex)
-            print(f"[scheduler] {ex}")
+            print(f"[scheduler] error={ex}")
         _scheduler_stop_event.wait(SCHEDULER_INTERVAL_SECONDS)
 
 
@@ -646,7 +816,7 @@ def _start_scheduler() -> None:
     global _scheduler_started
     _load_env_if_present()
     _load_scheduler_config()
-    if _scheduler_started or not SCHEDULER_ENABLED:
+    if _scheduler_started or not _scheduler_is_enabled():
         return
     _init_db()
     thread = threading.Thread(target=_scheduler_loop, daemon=True)
@@ -662,6 +832,10 @@ def _apply_backoff(ex: Exception) -> None:
     match = re.search(r"Retry in (\\d+) seconds", message)
     seconds = int(match.group(1)) if match else 3600
     _scheduler_backoff_until = datetime.now() + timedelta(seconds=seconds)
+    print(
+        f"[scheduler] backoff seconds={seconds} "
+        f"until={_scheduler_backoff_until.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
 
 @app.route("/", methods=["GET"])
@@ -672,6 +846,13 @@ def index():
     customer_id = request.args.get("customer_id") or _get_default_customer_id()
     days = int(request.args.get("days", SCHEDULER_DAYS))
     fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message = request.args.get("message")
+    scheduler_status = "running" if _scheduler_started else "stopped"
+    backoff_until = (
+        _scheduler_backoff_until.strftime("%Y-%m-%d %H:%M:%S")
+        if _scheduler_backoff_until
+        else None
+    )
 
     if not customer_id:
         return render_template_string(
@@ -682,6 +863,9 @@ def index():
             headers=[],
             rows=[],
             error=None,
+            message=message,
+            scheduler_status=scheduler_status,
+            backoff_until=backoff_until,
         )
 
     try:
@@ -711,6 +895,9 @@ def index():
             headers=headers,
             rows=rows,
             error=None,
+            message=message,
+            scheduler_status=scheduler_status,
+            backoff_until=backoff_until,
         )
     except Exception as ex:
         return render_template_string(
@@ -721,7 +908,39 @@ def index():
             headers=[],
             rows=[],
             error=str(ex),
+            message=message,
+            scheduler_status=scheduler_status,
+            backoff_until=backoff_until,
         )
+
+
+@app.route("/control", methods=["POST"])
+def control():
+    global _scheduler_forced_enabled
+    _load_env_if_present()
+    _load_scheduler_config()
+    action = request.form.get("action")
+    customer_id = request.form.get("customer_id") or _get_default_customer_id()
+    message = None
+
+    if action == "start":
+        _scheduler_forced_enabled = True
+        _start_scheduler()
+        message = "Scheduler started"
+    elif action == "stop":
+        _scheduler_forced_enabled = False
+        _stop_scheduler()
+        message = "Scheduler stopped"
+    elif action == "run_once":
+        if not customer_id:
+            message = "Missing customer_id"
+        else:
+            _run_once(customer_id, SCHEDULER_DAYS)
+            message = "Run complete"
+    else:
+        message = "Unknown action"
+
+    return redirect(url_for("index", customer_id=customer_id, message=message))
 
 
 @app.route("/history", methods=["GET"])
