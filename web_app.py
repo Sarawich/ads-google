@@ -115,7 +115,7 @@ TEMPLATE = """
     <div class="meta">Fetched at {{ fetched_at }}</div>
     <div class="meta"><a href="/history">View history</a></div>
     <div class="meta">
-      Scheduler: {{ scheduler_status }}{% if backoff_until %} • Backoff until {{ backoff_until }}{% endif %}
+      Scheduler: {{ scheduler_status }}{% if backoff_until %} | Backoff until {{ backoff_until }}{% endif %}
     </div>
     {% if message %}
       <div class="meta">{{ message }}</div>
@@ -293,7 +293,9 @@ HISTORY_TEMPLATE = """
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Google Ads History</title>
+    {% if auto_refresh %}
     <meta http-equiv="refresh" content="{{ refresh_seconds }}">
+    {% endif %}
     <style>
       :root { color-scheme: light; }
       body {
@@ -343,21 +345,41 @@ HISTORY_TEMPLATE = """
       .chart .dot {
         fill: #111827;
       }
+      .pager {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin-bottom: 16px;
+      }
+      .pager a {
+        text-decoration: none;
+        padding: 4px 10px;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+      }
     </style>
   </head>
   <body>
     <h1>Google Ads History</h1>
     <div class="meta"><a href="/">Back to live view</a></div>
     <div class="meta">
-      Auto-refresh: {{ refresh_seconds }}s •
-      Total runs: {{ stats.total_runs }} •
-      Total campaigns: {{ stats.total_campaigns }} •
-      Last run: {{ stats.last_run or "—" }}
+      Auto-refresh: {{ "on" if auto_refresh else "off" }}
+      {% if auto_refresh %}
+      ({{ refresh_seconds }}s)
+      {% endif %}
+      |
+      <a href="/history?page={{ page }}&page_size={{ page_size }}&auto_refresh={{ 0 if auto_refresh else 1 }}{% if run_id %}&run_id={{ run_id }}{% endif %}">
+        {{ "Pause refresh" if auto_refresh else "Resume refresh" }}
+      </a>
+      |
+      Total runs: {{ stats.total_runs }} |
+      Total campaigns: {{ stats.total_campaigns }} |
+      Last run: {{ stats.last_run or "-" }}
     </div>
     {% if stats.latest_run_id %}
       <div class="meta">
-        Latest run: #{{ stats.latest_run_id }} •
-        Campaigns: {{ stats.latest_campaigns }} •
+        Latest run: #{{ stats.latest_run_id }} |
+        Campaigns: {{ stats.latest_campaigns }} |
         Customer: {{ stats.latest_customer_id }}
       </div>
     {% endif %}
@@ -374,7 +396,7 @@ HISTORY_TEMPLATE = """
           {% endfor %}
         </svg>
         <div class="meta">
-          {{ five_min_series.start_label }} → {{ five_min_series.end_label }} •
+          {{ five_min_series.start_label }} to {{ five_min_series.end_label }} |
           max {{ five_min_series.max_value }}
         </div>
       {% else %}
@@ -394,7 +416,7 @@ HISTORY_TEMPLATE = """
           {% endfor %}
         </svg>
         <div class="meta">
-          {{ hourly_series.start_label }} → {{ hourly_series.end_label }} •
+          {{ hourly_series.start_label }} to {{ hourly_series.end_label }} |
           max {{ hourly_series.max_value }}
         </div>
       {% else %}
@@ -414,7 +436,7 @@ HISTORY_TEMPLATE = """
           {% endfor %}
         </svg>
         <div class="meta">
-          {{ daily_series.start_label }} → {{ daily_series.end_label }} •
+          {{ daily_series.start_label }} to {{ daily_series.end_label }} |
           max {{ daily_series.max_value }}
         </div>
       {% else %}
@@ -423,6 +445,15 @@ HISTORY_TEMPLATE = """
     </div>
 
     <h2>Runs</h2>
+    <div class="pager">
+      <div>Page {{ page }} / {{ total_pages }}</div>
+      {% if prev_page %}
+        <a href="/history?page={{ prev_page }}&page_size={{ page_size }}&auto_refresh={{ 1 if auto_refresh else 0 }}{% if run_id %}&run_id={{ run_id }}{% endif %}">Prev</a>
+      {% endif %}
+      {% if next_page %}
+        <a href="/history?page={{ next_page }}&page_size={{ page_size }}&auto_refresh={{ 1 if auto_refresh else 0 }}{% if run_id %}&run_id={{ run_id }}{% endif %}">Next</a>
+      {% endif %}
+    </div>
     <table>
       <thead>
         <tr>
@@ -436,7 +467,7 @@ HISTORY_TEMPLATE = """
       <tbody>
         {% for run in runs %}
           <tr>
-            <td><a href="/history?run_id={{ run.id }}">{{ run.id }}</a></td>
+            <td><a href="/history?run_id={{ run.id }}&page={{ page }}&page_size={{ page_size }}&auto_refresh={{ 1 if auto_refresh else 0 }}">{{ run.id }}</a></td>
             <td>{{ run.fetched_at }}</td>
             <td>{{ run.customer_id }}</td>
             <td>{{ run.days }}</td>
@@ -522,6 +553,15 @@ def _init_db() -> None:
             )
             """
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_fetched_at ON runs(fetched_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_campaigns_run_id ON campaigns(run_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_campaigns_name ON campaigns(campaign_name)"
+        )
 
 
 def _persist_run(customer_id: str, days: int, rows: List[ads.CampaignRow]) -> int:
@@ -567,7 +607,14 @@ def _persist_run(customer_id: str, days: int, rows: List[ads.CampaignRow]) -> in
     return int(run_id)
 
 
-def _fetch_runs(limit: int = 50) -> List[sqlite3.Row]:
+def _count_runs() -> int:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM runs").fetchone()
+        return int(row["cnt"]) if row else 0
+
+
+def _fetch_runs_page(page: int, page_size: int) -> List[sqlite3.Row]:
+    offset = (page - 1) * page_size
     with _get_conn() as conn:
         return conn.execute(
             """
@@ -578,9 +625,9 @@ def _fetch_runs(limit: int = 50) -> List[sqlite3.Row]:
             LEFT JOIN campaigns ON campaigns.run_id = runs.id
             GROUP BY runs.id
             ORDER BY runs.id DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (limit,),
+            (page_size, offset),
         ).fetchall()
 
 
@@ -947,7 +994,26 @@ def control():
 def history():
     _start_scheduler()
     _init_db()
-    runs = _fetch_runs()
+    auto_refresh_raw = request.args.get("auto_refresh", "1")
+    auto_refresh = auto_refresh_raw != "0"
+    page_raw = request.args.get("page", "1")
+    page_size_raw = request.args.get("page_size", "100")
+    try:
+        page = max(int(page_raw), 1)
+    except ValueError:
+        page = 1
+    try:
+        page_size = int(page_size_raw)
+    except ValueError:
+        page_size = 100
+    page_size = min(max(page_size, 20), 500)
+
+    total_runs = _count_runs()
+    total_pages = max((total_runs + page_size - 1) // page_size, 1)
+    if page > total_pages:
+        page = total_pages
+
+    runs = _fetch_runs_page(page, page_size)
     stats = _fetch_history_stats()
     daily_raw = _fetch_runs_per_day()
     hourly_raw = _fetch_runs_per_hour()
@@ -991,9 +1057,15 @@ def history():
         headers=headers,
         stats=stats,
         refresh_seconds=SCHEDULER_INTERVAL_SECONDS,
+        auto_refresh=auto_refresh,
         daily_series=daily_series,
         hourly_series=hourly_series,
         five_min_series=five_min_series,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        prev_page=(page - 1) if page > 1 else None,
+        next_page=(page + 1) if page < total_pages else None,
     )
 
 
